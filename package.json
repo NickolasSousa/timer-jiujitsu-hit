@@ -1,0 +1,9 @@
+{
+  "name": "interval-timer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 serve.py 8080",
+    "test": "node --test"
+  }
+}
