@@ -1,16 +1,19 @@
 <!doctype html>
 <!--
   Browser regression checks for the app (layout, sound scheduling, wake lock, fields, finish state).
-  Run: `npm start`, then open http://localhost:8080/tests/browser/regression.html
-  Uses a fake clock, a fake AudioContext and a fake Wake Lock inside an iframe. It overwrites this origin's
-  localStorage while running and restores the previous contents (your presets/config) at the end.
+  Run: `npm start`, then open http://127.0.0.1:8080/tests/browser/regression.html
+  Only runs at 127.0.0.1:8080: localStorage is per origin, so test data never reaches the app's real
+  presets at localhost:8080. Uses a fake clock, a fake AudioContext and a fake Wake Lock inside an iframe;
+  this origin's localStorage is overwritten while running and restored at the end.
 -->
 <meta charset="utf-8">
 <title>Regression checks</title>
 <body style="font:12px monospace;margin:6px">
 <pre id="out">running…</pre>
 <script>
-const savedStorage = Object.entries(localStorage); // restored at the end: the app shares this origin
+const TEST_HOST = '127.0.0.1:8080';
+const blocked = location.host !== TEST_HOST;
+const savedStorage = Object.entries(localStorage); // restored at the end
 const results = [];
 const check = (name, cond, extra = '') => results.push(`${cond ? 'PASS' : 'FAIL'} ${name}${cond ? '' : '  → ' + extra}`);
 const show = () => (document.getElementById('out').textContent = results.join('\n') + '\n' +
@@ -92,7 +95,11 @@ async function app(width, config, options) {
   };
 }
 
-(async () => {
+if (blocked) {
+  document.getElementById('out').textContent =
+    `Testes não executados em ${location.host}: aqui eles sobrescreveriam as predefinições reais do app.\n` +
+    `Abra http://${TEST_HOST}/tests/browser/regression.html (origem separada, dados isolados).`;
+} else (async () => {
   try {
     const A = 4500;
 
@@ -242,6 +249,27 @@ async function app(width, config, options) {
       check('UX-04 dialog saves once valid', !$('#preset-dialog').open && a.d.querySelectorAll('.preset').length === before + 1 &&
         [...a.d.querySelectorAll('.preset-meta')].some((m) => m.textContent.startsWith('00:45')));
       check('UX-04 new preset loaded into the config form', fe.workMin.value === '0' && fe.workSec.value === '45' && !fe.workMin.hasAttribute('aria-invalid'));
+
+      // P1: an invalid activity can never start a workout with the previous config
+      type('#config-form', 'workMin', '0'); type('#config-form', 'workSec', ''); leave('#config-form', 'workSec');
+      check('P1 invalid activity disables Iniciar, error kept', $('#btn-toggle').disabled && fe.workSec.getAttribute('aria-invalid') === 'true');
+      type('#config-form', 'cycles', '3'); leave('#config-form', 'cycles');
+      type('#config-form', 'restSec', '15'); leave('#config-form', 'restSec');
+      check('P1 editing rest/cycles keeps Iniciar disabled', $('#btn-toggle').disabled);
+      $('#btn-toggle').click();
+      a.d.body.dispatchEvent(new a.w.KeyboardEvent('keydown', { code: 'Space', bubbles: true }));
+      check('P1 click and Space cannot start', a.d.body.dataset.status === 'idle');
+      type('#config-form', 'workSec', '20');
+      check('P1 fixing the field re-enables Iniciar', !$('#btn-toggle').disabled && !fe.workSec.hasAttribute('aria-invalid'));
+      $('#btn-toggle').click();
+      check('P1 starts with the corrected config (incl. cycles/rest edited meanwhile)',
+        a.d.body.dataset.status === 'running' && text('#time') === '00:20' && text('#cycle') === 'Ciclo 1 de 3', `${text('#time')} ${text('#cycle')}`);
+      a.clock.t += 10 * 60000; a.render();
+      check('P1 workout finished', a.d.body.dataset.status === 'finished');
+      type('#config-form', 'workSec', ''); leave('#config-form', 'workSec');
+      check('P1 after finishing, invalid activity disables Iniciar novamente and Reiniciar', $('#btn-toggle').disabled && $('#btn-restart').disabled);
+      a.d.querySelector('.preset-select').click();
+      check('P1 selecting a preset makes it valid and re-enables Iniciar', !$('#btn-toggle').disabled && !fe.workSec.hasAttribute('aria-invalid'));
       a.f.remove();
     }
   } catch (e) {

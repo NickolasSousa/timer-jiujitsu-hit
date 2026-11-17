@@ -141,11 +141,13 @@ function applyConfig(config, presetId = selectedPresetId) {
 function syncConfigFields() {
   writeTimerFields(el.configForm, timer.config);
   checkActivity(el.configForm, el.configFeedback);
+  render(); // the start button's state depends on the fields
 }
 
 el.configForm.addEventListener('input', () => {
-  // A zero-length activity is never applied: the timer keeps the last valid config.
-  if (!durationOf(el.configForm, 'work')) return;
+  // A zero-length activity is never applied: the timer keeps the last valid config,
+  // and render() disables starting until the activity is fixed.
+  if (!durationOf(el.configForm, 'work')) return render();
   checkActivity(el.configForm, el.configFeedback);
   const config = readTimerFields(el.configForm);
   const selected = presets.find((p) => p.id === selectedPresetId);
@@ -311,7 +313,11 @@ function render() {
   el.progress.setAttribute('aria-valuenow', String(Math.round(percent)));
 
   el.toggle.textContent = { idle: 'Iniciar', running: 'Pausar', paused: 'Continuar', finished: 'Iniciar novamente' }[status];
-  el.restart.disabled = status === 'idle';
+  // Starting fresh (Iniciar from idle/finished, or Reiniciar after finishing) would run the last
+  // valid config while the form shows an invalid 0:00 activity: not allowed until it is fixed.
+  const activityInvalid = !durationOf(el.configForm, 'work');
+  el.toggle.disabled = activityInvalid && (status === 'idle' || status === 'finished');
+  el.restart.disabled = status === 'idle' || (activityInvalid && status === 'finished');
   el.stop.disabled = status === 'idle';
 
   const locked = status === 'running' || status === 'paused';
