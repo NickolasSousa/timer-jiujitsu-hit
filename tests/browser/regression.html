@@ -1,0 +1,254 @@
+<!doctype html>
+<!--
+  Browser regression checks for the app (layout, sound scheduling, wake lock, fields, finish state).
+  Run: `npm start`, then open http://localhost:8080/tests/browser/regression.html
+  Uses a fake clock, a fake AudioContext and a fake Wake Lock inside an iframe. It overwrites this origin's
+  localStorage while running and restores the previous contents (your presets/config) at the end.
+-->
+<meta charset="utf-8">
+<title>Regression checks</title>
+<body style="font:12px monospace;margin:6px">
+<pre id="out">running…</pre>
+<script>
+const savedStorage = Object.entries(localStorage); // restored at the end: the app shares this origin
+const results = [];
+const check = (name, cond, extra = '') => results.push(`${cond ? 'PASS' : 'FAIL'} ${name}${cond ? '' : '  → ' + extra}`);
+const show = () => (document.getElementById('out').textContent = results.join('\n') + '\n' +
+  `TOTAL ${results.filter((r) => r.startsWith('PASS')).length} pass / ${results.filter((r) => r.startsWith('FAIL')).length} fail`);
+const flush = async (n = 10) => { for (let i = 0; i < n; i++) await null; };
+
+function frame(width, height) {
+  return new Promise((resolve) => {
+    const f = document.createElement('iframe');
+    f.style.cssText = `width:${width}px;height:${height}px;border:0;display:block`;
+    f.src = '../../index.html';
+    f.onload = () => resolve(f);
+    document.body.append(f);
+  });
+}
+
+function instrument(w, { refuseWakeLock = false } = {}) {
+  const log = { notes: [], outputs: [], resumes: 0, ctx: null, allowResume: true };
+  class FakeCtx extends w.EventTarget {
+    constructor() { super(); log.ctx = this; this.currentTime = 100; this.state = 'running'; this.destination = {}; }
+    resume() {
+      log.resumes++;
+      if (log.allowResume && this.state !== 'running') { this.state = 'running'; this.dispatchEvent(new w.Event('statechange')); }
+      return Promise.resolve();
+    }
+    createOscillator() {
+      const o = { type: '', frequency: { value: 0 }, connect: (g) => { o.gainNode = g; return g; }, start: (at) => log.notes.push({ f: o.frequency.value, type: o.type, at, out: o.gainNode.out }), stop() {} };
+      return o;
+    }
+    createGain() {
+      const g = { gain: { setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} }, connected: false };
+      g.connect = (x) => { if (x === this.destination) { g.connected = true; log.outputs.push(g); } else g.out = x; return x; };
+      g.disconnect = () => { g.connected = false; };
+      return g;
+    }
+  }
+  w.AudioContext = FakeCtx;
+  const wl = { requests: 0, pending: [], live: new Set() };
+  Object.defineProperty(w.navigator, 'wakeLock', { configurable: true, value: {
+    request() {
+      wl.requests++;
+      if (refuseWakeLock) return Promise.reject(new w.DOMException('refused', 'NotAllowedError'));
+      return new Promise((res) => wl.pending.push(() => {
+        const lock = new w.EventTarget();
+        lock.release = () => { wl.live.delete(lock); lock.dispatchEvent(new w.Event('release')); return Promise.resolve(); };
+        wl.live.add(lock);
+        res(lock);
+      }));
+    },
+  } });
+  wl.resolveAll = async () => { while (wl.pending.length) wl.pending.shift()(); await flush(); };
+  return { log, wl };
+}
+
+const connectedOutputs = (log) => log.outputs.filter((g) => g.connected);
+const notesOn = (log, g) => log.notes.filter((n) => n.out === g);
+
+async function app(width, config, options) {
+  localStorage.clear();
+  if (config) localStorage.setItem('interval-timer:settings:v1', JSON.stringify({ config, selectedPresetId: null }));
+  const f = await frame(width, 1400);
+  const w = f.contentWindow, d = f.contentDocument;
+  const st = d.createElement('style'); st.textContent = '*{transition:none!important}'; d.head.append(st);
+  const clock = { t: 0 };
+  w.performance.now = () => clock.t;
+  w.confirm = () => true;
+  // Controlled render ticks: the app's setInterval callbacks run only when tick() is called.
+  const intervals = [];
+  w.setInterval = (fn) => intervals.push(fn);
+  w.clearInterval = (id) => { intervals[id - 1] = null; };
+  const fakes = instrument(w, options);
+  const $ = (s) => d.querySelector(s);
+  return { f, w, d, $, clock, ...fakes,
+    text: (s) => $(s).textContent,
+    tick: (n = 5) => { for (let i = 0; i < n; i++) intervals.forEach((fn) => fn && fn()); },
+    render: () => d.dispatchEvent(new w.Event('visibilitychange')), // the app re-renders when the tab becomes visible
+    type: (form, name, value) => { const i = $(form).elements[name]; i.value = value; i.dispatchEvent(new w.Event('input', { bubbles: true })); },
+    leave: (form, name) => $(form).elements[name].dispatchEvent(new w.Event('change', { bubbles: true })),
+  };
+}
+
+(async () => {
+  try {
+    const A = 4500;
+
+    // ---------- UX-01: long preset names at 320 / 375 / 1280 ----------
+    for (const width of [320, 375, 1280]) {
+      localStorage.clear();
+      localStorage.setItem('interval-timer:presets:v1', JSON.stringify([
+        { id: 'a', name: 'Jiu-Jitsu competição', workSeconds: 300, restSeconds: 60, cycles: 6 },
+        { id: 'b', name: 'WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW', workSeconds: 40, restSeconds: 20, cycles: 10 },
+      ]));
+      const f = await frame(width, 2400); // tall: no vertical scrollbar, so only real overflow counts
+      const d = f.contentDocument, de = d.documentElement;
+      const name = d.querySelectorAll('.preset-name')[1];
+      check(`UX-01 ${width}px: page not wider than screen`, de.scrollWidth <= de.clientWidth, `${de.scrollWidth} > ${de.clientWidth}`);
+      check(`UX-01 ${width}px: timer card inside screen`, d.querySelector('.timer').getBoundingClientRect().right <= de.clientWidth);
+      check(`UX-01 ${width}px: long name truncated`, name.scrollWidth > name.clientWidth);
+      f.remove();
+    }
+
+    // ---------- Sounds (UX-02), wake lock (QA-01 / R-04), finish (QA-02/03) ----------
+    {
+      const a = await app(390, { workSeconds: 10, restSeconds: 8, cycles: 2 });
+      const { $, log, wl, clock, render, text, tick } = a;
+      $('#btn-toggle').click();
+      let outs = connectedOutputs(log);
+      let n = notesOn(log, outs[0]);
+      const rel = (x) => Math.round((x.at - n[0].at) * 1000);
+      check('UX-02 start: one schedule with the whole workout', outs.length === 1 && n.filter((x) => x.type === 'square').length === 38 && n.filter((x) => x.f === 1046).length === 1);
+      check('UX-02 alarm at end of activity, ticks in last 5s of rest',
+        Math.min(...n.filter((x) => x.type === 'square').map(rel)) === 10000 &&
+        JSON.stringify(n.filter((x) => x.f === 660 && rel(x) < 30000).map(rel)) === '[17500,18500,19500,20500,21500]');
+      check('R-04 start requests the wake lock once', wl.requests === 1);
+      await wl.resolveAll();
+      clock.t = 10500;
+      tick(); // several render ticks
+      check('UX-02 renders add no sounds', connectedOutputs(log).length === 1 && log.notes.length === n.length);
+      check('R-04 renders do not request the wake lock', wl.requests === 1, wl.requests);
+
+      clock.t = 12000; $('#btn-toggle').click(); // pause mid-alarm
+      check('UX-02 pause cancels sounds', connectedOutputs(log).length === 0);
+      check('QA-01 pause releases the lock', wl.live.size === 0);
+      clock.t = 50000; $('#btn-toggle').click(); // resume
+      outs = connectedOutputs(log); n = notesOn(log, outs[0]);
+      check('UX-02 resume: remaining alarm only, no repeated activity beep', outs.length === 1 &&
+        n.filter((x) => x.type === 'square' && x.at - n[0].at < 2.5).length === 11 && n.filter((x) => x.f === 880 && x.type === 'sine' && x.at - n[0].at < 1).length === 0);
+      check('R-04 resume requests again', wl.requests === 2, wl.requests);
+      $('#btn-toggle').click(); await wl.resolveAll(); // pause while the request was pending
+      check('QA-01 lock arriving after pause is released', wl.live.size === 0);
+
+      $('#btn-toggle').click(); await wl.resolveAll();
+      [...wl.live][0].release(); // browser drops it when the tab hides
+      const r0 = wl.requests;
+      render(); await wl.resolveAll();
+      check('R-04 back to tab: exactly one new request', wl.requests === r0 + 1 && wl.live.size === 1);
+
+      // R-05: audio suspended by the OS, resume refused outside a gesture
+      const outsBefore = log.outputs.length;
+      render(); await flush();
+      check('R-05 audio running on return: no hint, no reschedule', $('#audio-hint').hidden && log.outputs.length === outsBefore);
+      log.ctx.state = 'suspended'; log.allowResume = false;
+      render(); await flush();
+      check('R-05 audio still suspended on return: hint shown', !$('#audio-hint').hidden, `hidden=${$('#audio-hint').hidden}`);
+      const resumes = log.resumes;
+      log.allowResume = true;
+      a.d.body.dispatchEvent(new a.w.MouseEvent('click', { bubbles: true })); // the tap
+      await flush();
+      check('R-05 tap retries resume, hides hint, reschedules once', log.resumes > resumes && $('#audio-hint').hidden &&
+        connectedOutputs(log).length === 1 && log.outputs.length === outsBefore + 1);
+      log.ctx.state = 'suspended'; log.allowResume = false;
+      render(); await flush();
+      $('#btn-toggle').click(); // pausing (allowed resume stays refused here)
+      check('R-05 hint hidden when not running', $('#audio-hint').hidden);
+      log.allowResume = true; log.ctx.state = 'running';
+
+      // QA-02/03: "Pausar" right after the end
+      $('#btn-stop').click();
+      check('QA-01 stop releases lock and cancels sounds', wl.live.size === 0 && connectedOutputs(log).length === 0);
+      $('#btn-toggle').click(); await wl.resolveAll();
+      outs = connectedOutputs(log);
+      clock.t += 10000 + A + 8000 + 10000 + A + 50;
+      $('#btn-toggle').click();
+      check('QA-02 shows "Treino concluído", no "undefined"', text('#phase-label') === 'Treino concluído' && !a.d.body.textContent.includes('undefined'));
+      check('QA-03 finish chime not cancelled', outs.length === 1 && outs[0].connected);
+      check('QA-01 finished releases lock', wl.live.size === 0);
+      a.f.remove();
+    }
+
+    // ---------- R-04: browser refuses the wake lock ----------
+    {
+      const a = await app(390, { workSeconds: 30, restSeconds: 10, cycles: 2 }, { refuseWakeLock: true });
+      a.$('#btn-toggle').click();
+      await flush();
+      a.tick();
+      check('R-04 refused lock: not re-requested on every render', a.wl.requests === 1, a.wl.requests);
+      a.$('#btn-toggle').click(); a.$('#btn-toggle').click(); await flush(); // pause + continue
+      check('R-04 refused lock: retried on continue', a.wl.requests === 2, a.wl.requests);
+      a.render(); await flush();
+      check('R-04 refused lock: retried on return to tab', a.wl.requests === 3, a.wl.requests);
+      a.$('#btn-stop').click();
+      a.f.remove();
+    }
+
+    // ---------- UX-04: fields ----------
+    {
+      const a = await app(390, { workSeconds: 300, restSeconds: 60, cycles: 6 });
+      const { $, text, type, leave } = a;
+      const fe = $('#config-form').elements;
+      const saved = () => JSON.parse(localStorage.getItem('interval-timer:settings:v1')).config;
+      type('#config-form', 'workMin', '');
+      check('UX-04 empty field stays empty while typing, seconds untouched', fe.workMin.value === '' && fe.workSec.value === '0');
+      check('UX-04 zero activity not applied to timer or saved', text('#time') === '05:00' && saved().workSeconds === 300);
+      leave('#config-form', 'workMin');
+      check('UX-04 zero activity flagged invalid', fe.workMin.value === '0' && fe.workMin.getAttribute('aria-invalid') === 'true' &&
+        $('#config-feedback').classList.contains('is-error') && $('#config-feedback').textContent.includes('1 segundo'));
+      type('#config-form', 'workSec', '30');
+      check('UX-04 valid again: applied, error cleared', text('#time') === '00:30' && !fe.workSec.hasAttribute('aria-invalid') && $('#config-feedback').textContent === '');
+      leave('#config-form', 'workSec');
+      type('#config-form', 'workMin', '2'); leave('#config-form', 'workMin');
+      check('UX-04 minutes edit keeps seconds', fe.workSec.value === '30' && text('#time') === '02:30');
+      type('#config-form', 'workSec', '75');
+      check('UX-04 75 s counts as 1:15 while typing', text('#time') === '03:15', text('#time'));
+      leave('#config-form', 'workSec');
+      check('UX-04 75 s converted on leaving the field', fe.workMin.value === '3' && fe.workSec.value === '15' && text('#time') === '03:15');
+      check('UX-04 conversion shown discreetly', $('#config-feedback').textContent === 'Convertido para 3 min 15 s.' && !$('#config-feedback').classList.contains('is-error'));
+      check('UX-04 rest fields untouched by activity edits', fe.restMin.value === '1' && fe.restSec.value === '0');
+      type('#config-form', 'restSec', '-5'); leave('#config-form', 'restSec');
+      check('UX-04 negative clamps to 0 in its own field', fe.restSec.value === '0');
+      type('#config-form', 'workMin', '99'); type('#config-form', 'workSec', '75'); leave('#config-form', 'workSec');
+      check('UX-04 carry capped at 99:59', fe.workMin.value === '99' && fe.workSec.value === '59');
+      type('#config-form', 'cycles', ''); leave('#config-form', 'cycles');
+      check('UX-04 empty cycles → 1', fe.cycles.value === '1');
+
+      // Preset dialog
+      $('#btn-new-preset').click();
+      const pf = $('#preset-form').elements;
+      check('UX-04 dialog opens without stale feedback', $('#preset-feedback').textContent === '');
+      pf.name.value = 'Teste';
+      type('#preset-form', 'workMin', '0'); type('#preset-form', 'workSec', '90'); leave('#preset-form', 'workSec');
+      check('UX-04 dialog converts 90 s → 1:30 with message', pf.workMin.value === '1' && pf.workSec.value === '30' && $('#preset-feedback').textContent.includes('1 min 30 s'));
+      const before = a.d.querySelectorAll('.preset').length;
+      type('#preset-form', 'workMin', '0'); type('#preset-form', 'workSec', '0');
+      $('#preset-form').requestSubmit();
+      check('UX-04 dialog refuses zero activity', $('#preset-dialog').open && a.d.querySelectorAll('.preset').length === before &&
+        pf.workMin.getAttribute('aria-invalid') === 'true');
+      type('#preset-form', 'workSec', '45');
+      $('#preset-form').requestSubmit();
+      check('UX-04 dialog saves once valid', !$('#preset-dialog').open && a.d.querySelectorAll('.preset').length === before + 1 &&
+        [...a.d.querySelectorAll('.preset-meta')].some((m) => m.textContent.startsWith('00:45')));
+      check('UX-04 new preset loaded into the config form', fe.workMin.value === '0' && fe.workSec.value === '45' && !fe.workMin.hasAttribute('aria-invalid'));
+      a.f.remove();
+    }
+  } catch (e) {
+    results.push('ERROR ' + e.stack);
+  }
+  localStorage.clear();
+  for (const [key, value] of savedStorage) localStorage.setItem(key, value);
+  show();
+})();
+</script>

@@ -20,6 +20,7 @@
         <div class="progress-bar" id="progress-bar"></div>
       </div>
       <p class="total" id="total">Total 35:00</p>
+      <p class="hint" id="audio-hint" role="status" hidden>O navegador pausou o som. Toque na tela para tentar reativar.</p>
 
       <div class="controls">
         <button type="button" class="btn btn-primary" id="btn-toggle">Iniciar</button>
@@ -34,6 +35,7 @@
         <form id="config-form" novalidate>
           <fieldset id="config-fieldset" class="fields"></fieldset>
         </form>
+        <p class="hint" id="config-feedback" aria-live="polite"></p>
         <p class="hint" id="config-lock-hint" hidden>Encerre o treino para alterar a configuração.</p>
       </section>
 
@@ -56,6 +58,7 @@
         <input type="text" name="name" maxlength="40" required autocomplete="off" placeholder="Ex.: Jiu-Jitsu">
       </label>
       <div class="fields" id="preset-fields"></div>
+      <p class="hint" id="preset-feedback" aria-live="polite"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="btn-cancel-preset">Cancelar</button>
         <button type="submit" class="btn btn-primary">Salvar</button>

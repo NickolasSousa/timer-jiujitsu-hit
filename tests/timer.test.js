@@ -152,3 +152,14 @@ test('controller: pausing during the alarm holds it; resume finishes it before r
   clock.advance(A - 1000);
   assert.deepEqual([timer.snapshot().phase, timer.snapshot().remainingMs], ['rest', 5000]);
 });
+
+test('controller: pausing just after the end (before any render) finishes instead of pausing', () => {
+  const clock = fakeClock();
+  const timer = new IntervalTimer({ workSeconds: 5, restSeconds: 0, cycles: 1 }, clock);
+  timer.start();
+  clock.advance(5000 + A + 50); // ended 50ms ago, snapshot() not called yet
+  timer.toggle(); // user hits "Pausar"
+  assert.equal(timer.status, 'finished');
+  const s = timer.snapshot();
+  assert.deepEqual([s.status, s.phase, s.progress], ['finished', 'done', 1]);
+});

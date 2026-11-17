@@ -115,10 +115,11 @@ export class IntervalTimer {
     this.status = 'running';
   }
 
+  /** If the workout already ended (no render since), it becomes finished instead of paused. */
   pause() {
     if (this.status !== 'running') return;
     this.accumulatedMs = this.elapsedMs();
-    this.status = 'paused';
+    this.status = this.accumulatedMs >= this.totalMs ? 'finished' : 'paused';
   }
 
   toggle() {

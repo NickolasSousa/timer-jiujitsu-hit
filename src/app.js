@@ -1,11 +1,10 @@
 // UI layer: wires DOM ↔ timer engine ↔ repository. No timing math lives here.
 
-import { IntervalTimer, formatTime, normalizeConfig } from './timer.js';
+import { IntervalTimer, MAX_DURATION_SECONDS, formatTime, normalizeConfig } from './timer.js';
 import { createLocalStorageRepository } from './storage.js';
-import { sounds, unlockAudio } from './sound.js';
+import { isAudioSuspended, onAudioRunning, resumeAudio, scheduleWorkoutSounds, unlockAudio } from './sound.js';
 
-const TICK_MS = 100; // only triggers re-render (and countdown ticks); elapsed time comes from timestamps
-const COUNTDOWN_SECONDS = 5; // one tick per second at the end of each rest
+const TICK_MS = 100; // only triggers re-render; elapsed time comes from timestamps, sounds from the audio clock
 const BASE_TITLE = 'Interval Timer';
 const LABELS = { work: 'Atividade', alarm: 'Fim da atividade', rest: 'Descanso' };
 
@@ -17,18 +16,21 @@ const el = {
   progress: $('progress'),
   progressBar: $('progress-bar'),
   total: $('total'),
+  audioHint: $('audio-hint'),
   toggle: $('btn-toggle'),
   restart: $('btn-restart'),
   stop: $('btn-stop'),
   configForm: $('config-form'),
   configFieldset: $('config-fieldset'),
   configLockHint: $('config-lock-hint'),
+  configFeedback: $('config-feedback'),
   newPreset: $('btn-new-preset'),
   presetList: $('preset-list'),
   presetEmpty: $('preset-empty'),
   dialog: $('preset-dialog'),
   dialogTitle: $('preset-dialog-title'),
   presetForm: $('preset-form'),
+  presetFeedback: $('preset-feedback'),
   cancelPreset: $('btn-cancel-preset'),
 };
 
@@ -37,11 +39,10 @@ const settings = repo.loadSettings();
 let presets = repo.listPresets();
 let selectedPresetId = settings.selectedPresetId;
 let editingPresetId = null;
-let lastPhaseIndex = null; // for detecting phase transitions (sounds)
-let lastCountdownKey = null; // `${phaseIndex}:${second}` already ticked, so pause/resume never repeats one
-let alarm = null; // { phaseIndex, stop } while the end-of-activity alarm is sounding
+let cancelSounds = null; // cancels the sounds scheduled for the running workout
 let tickHandle = null;
 let wakeLock = null;
+let wakeLockPending = false;
 
 const timer = new IntervalTimer(settings.config);
 
@@ -51,13 +52,65 @@ const fieldsTemplate = $('timer-fields-template');
 el.configFieldset.append(fieldsTemplate.content.cloneNode(true));
 $('preset-fields').append(fieldsTemplate.content.cloneNode(true));
 
+/** A field's value clamped to its own min/max attributes; empty or invalid counts as its min. */
+function fieldValue(input) {
+  const n = Math.floor(Number(input.value));
+  const min = Number(input.min);
+  return Number.isFinite(n) ? Math.min(Number(input.max), Math.max(min, n)) : min;
+}
+
+/** Non-negative integer typed in a field; empty, negative or invalid counts as 0. */
+function typedInt(input) {
+  const n = Math.floor(Number(input.value));
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** Total seconds of the "work" or "rest" fields; seconds may exceed 59 (75 s = 1:15). */
+function durationOf(form, prefix) {
+  return Math.min(MAX_DURATION_SECONDS, fieldValue(form.elements[`${prefix}Min`]) * 60 + typedInt(form.elements[`${prefix}Sec`]));
+}
+
 function readTimerFields(form) {
-  const num = (name) => Number(form.elements[name].value) || 0;
   return normalizeConfig({
-    workSeconds: num('workMin') * 60 + num('workSec'),
-    restSeconds: num('restMin') * 60 + num('restSec'),
-    cycles: form.elements.cycles.value,
+    workSeconds: durationOf(form, 'work'),
+    restSeconds: durationOf(form, 'rest'),
+    cycles: fieldValue(form.elements.cycles),
   });
+}
+
+const feedbackTimeouts = new WeakMap();
+
+/** Discreet message under a form; informational ones fade after a few seconds, errors stay. */
+function showFeedback(target, message, { error = false } = {}) {
+  clearTimeout(feedbackTimeouts.get(target));
+  target.textContent = message;
+  target.classList.toggle('is-error', error);
+  if (message && !error) feedbackTimeouts.set(target, setTimeout(() => (target.textContent = ''), 4000));
+}
+
+/** Flags a zero-length activity as invalid (it is never applied or saved). Returns whether it is valid. */
+function checkActivity(form, feedback) {
+  const valid = durationOf(form, 'work') > 0;
+  for (const name of ['workMin', 'workSec']) {
+    if (valid) form.elements[name].removeAttribute('aria-invalid');
+    else form.elements[name].setAttribute('aria-invalid', 'true');
+  }
+  if (!valid) showFeedback(feedback, 'A atividade precisa ter pelo menos 1 segundo.', { error: true });
+  else if (feedback.classList.contains('is-error')) showFeedback(feedback, '');
+  return valid;
+}
+
+/** On leaving a field: seconds above 59 carry into that duration's minutes; other fields only clamp themselves. */
+function normalizeField(form, input, feedback) {
+  const prefix = /^(work|rest)Sec$/.exec(input.name)?.[1];
+  if (prefix && typedInt(input) > 59) {
+    const total = durationOf(form, prefix);
+    form.elements[`${prefix}Min`].value = Math.floor(total / 60);
+    input.value = total % 60;
+    showFeedback(feedback, `Convertido para ${Math.floor(total / 60)} min ${total % 60} s.`);
+  } else {
+    input.value = fieldValue(input);
+  }
 }
 
 function writeTimerFields(form, { workSeconds, restSeconds, cycles }) {
@@ -80,40 +133,57 @@ const describeConfig = ({ workSeconds, restSeconds, cycles }) =>
 function applyConfig(config, presetId = selectedPresetId) {
   if (!timer.setConfig(config)) return; // locked while a workout is in progress
   selectedPresetId = presetId;
-  lastPhaseIndex = null;
   repo.saveSettings({ config: timer.config, selectedPresetId });
   render();
   renderPresets();
 }
 
+function syncConfigFields() {
+  writeTimerFields(el.configForm, timer.config);
+  checkActivity(el.configForm, el.configFeedback);
+}
+
 el.configForm.addEventListener('input', () => {
+  // A zero-length activity is never applied: the timer keeps the last valid config.
+  if (!durationOf(el.configForm, 'work')) return;
+  checkActivity(el.configForm, el.configFeedback);
   const config = readTimerFields(el.configForm);
   const selected = presets.find((p) => p.id === selectedPresetId);
   applyConfig(config, selected && sameConfig(selected, config) ? selected.id : null);
 });
-// Write back the normalized values once the user leaves a field (e.g. 75s → 1min 15s).
-el.configForm.addEventListener('change', () => writeTimerFields(el.configForm, timer.config));
+// While typing a field may be empty; values are normalized only when leaving it, and other
+// fields are never rewritten (except the minutes receiving a seconds carry-over).
+el.configForm.addEventListener('change', (e) => {
+  if (!e.target.matches('input')) return;
+  normalizeField(el.configForm, e.target, el.configFeedback);
+  checkActivity(el.configForm, el.configFeedback);
+});
 el.configForm.addEventListener('submit', (e) => e.preventDefault());
 
 // ---------- Timer controls ----------
 
 el.toggle.addEventListener('click', () => {
   unlockAudio();
-  if (timer.status !== 'paused' && timer.status !== 'running') lastPhaseIndex = -1; // fresh start → beep
   timer.toggle();
+  // A "pause" that lands after the end becomes finished: let the finish chime play out.
+  if (timer.status === 'running') {
+    scheduleSounds();
+    requestWakeLock();
+  } else if (timer.status === 'paused') stopSounds();
   render();
 });
 
 el.restart.addEventListener('click', () => {
   unlockAudio();
-  lastPhaseIndex = -1;
   timer.restart();
+  scheduleSounds();
+  requestWakeLock();
   render();
 });
 
 el.stop.addEventListener('click', () => {
   timer.reset();
-  lastPhaseIndex = null;
+  stopSounds();
   render();
 });
 
@@ -126,10 +196,40 @@ document.addEventListener('keydown', (e) => {
 
 // Background tabs throttle timers; re-render immediately on return (time is already correct).
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    render();
-    if (timer.status === 'running') requestWakeLock();
-  }
+  if (document.visibilityState !== 'visible') return;
+  render();
+  if (timer.status === 'running') requestWakeLock(); // browsers release it when the tab is hidden
+  // If the OS suspended audio, onAudioRunning reschedules once it runs again. Some browsers (iOS)
+  // only allow that from a user gesture: then ask for a tap (the resume may never settle).
+  resumeAudio().then(updateAudioHint);
+  setTimeout(updateAudioHint, 1000);
+});
+
+function updateAudioHint() {
+  el.audioHint.hidden = !(timer.status === 'running' && isAudioSuspended());
+}
+
+// Any interaction while the hint is shown retries the resume inside the gesture.
+for (const type of ['click', 'touchend', 'keydown']) {
+  document.addEventListener(type, () => el.audioHint.hidden || unlockAudio(), true);
+}
+
+// ---------- Sounds ----------
+
+function scheduleSounds() {
+  cancelSounds?.();
+  cancelSounds = scheduleWorkoutSounds(timer.phases, timer.elapsedMs());
+}
+
+function stopSounds() {
+  cancelSounds?.();
+  cancelSounds = null;
+}
+
+// A suspended audio context froze its clock, so the old schedule is late: redo it from now.
+onAudioRunning(() => {
+  el.audioHint.hidden = true;
+  if (timer.status === 'running') scheduleSounds();
 });
 
 function syncTicker() {
@@ -141,50 +241,34 @@ function syncTicker() {
   }
 }
 
+// Keeps the phone screen on during the workout, where supported.
+// One request at a time; a lock that arrives after the workout stopped running is released at once.
 async function requestWakeLock() {
-  // Keeps the phone screen on during the workout, where supported.
+  if (!('wakeLock' in navigator) || wakeLock || wakeLockPending) return;
+  wakeLockPending = true;
   try {
-    if ('wakeLock' in navigator && !wakeLock) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => (wakeLock = null));
+    const lock = await navigator.wakeLock.request('screen');
+    if (timer.status !== 'running') {
+      lock.release().catch(() => {});
+      return;
     }
+    wakeLock = lock;
+    lock.addEventListener('release', () => {
+      if (wakeLock === lock) wakeLock = null;
+    });
   } catch {
     /* not critical */
+  } finally {
+    wakeLockPending = false;
   }
 }
 
+// Requests happen only on start/resume/restart/return to the tab (never per render), so a
+// browser that refuses the lock isn't asked again 10×/s. Release happens as soon as it stops running.
 function syncWakeLock() {
-  if (timer.status === 'running') requestWakeLock();
-  else if (wakeLock) wakeLock.release().catch(() => {});
-}
-
-function playTransitionSound(snap) {
-  const active = snap.status === 'running' || snap.status === 'finished';
-  if (active && lastPhaseIndex !== null && snap.phaseIndex !== lastPhaseIndex) {
-    // Coming back from a long background stretch may skip phases: play only the current one.
-    // (alarm has its own sync below; rest starts silently because the alarm just announced it)
-    ({ work: sounds.work, done: sounds.finish })[snap.phase]?.();
-  }
-  lastPhaseIndex = active || snap.status === 'paused' ? snap.phaseIndex : null;
-}
-
-/** Alarm sounds only while running inside an alarm phase: stops on pause/stop/restart, resumes with the remaining time. */
-function syncAlarm(snap) {
-  const shouldPlay = snap.status === 'running' && snap.phase === 'alarm';
-  if (alarm && (!shouldPlay || alarm.phaseIndex !== snap.phaseIndex)) {
-    alarm.stop();
-    alarm = null;
-  }
-  if (shouldPlay && !alarm) alarm = { phaseIndex: snap.phaseIndex, stop: sounds.alarm(snap.remainingMs / 1000) };
-}
-
-function playCountdown(snap) {
-  if (snap.status !== 'running' || snap.phase !== 'rest') return;
-  const second = Math.ceil(snap.remainingMs / 1000);
-  const key = `${snap.phaseIndex}:${second}`;
-  if (second <= COUNTDOWN_SECONDS && key !== lastCountdownKey) {
-    lastCountdownKey = key;
-    sounds.tick();
+  if (timer.status !== 'running' && wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
   }
 }
 
@@ -193,9 +277,6 @@ function playCountdown(snap) {
 function render() {
   const snap = timer.snapshot();
   const { status, cycles } = snap;
-  playTransitionSound(snap);
-  syncAlarm(snap);
-  playCountdown(snap);
 
   let label, time, cycleText, totalText;
   if (status === 'idle') {
@@ -236,6 +317,7 @@ function render() {
   const locked = status === 'running' || status === 'paused';
   el.configFieldset.disabled = locked;
   el.configLockHint.hidden = !locked;
+  if (status !== 'running') el.audioHint.hidden = true;
   el.presetList.querySelectorAll('.preset-select').forEach((b) => (b.disabled = locked));
 
   document.title = status === 'idle' ? BASE_TITLE : `${time} · ${label} — ${BASE_TITLE}`;
@@ -269,7 +351,7 @@ function renderPresets() {
       select.append(name, meta);
       select.addEventListener('click', () => {
         applyConfig(preset, preset.id);
-        writeTimerFields(el.configForm, timer.config);
+        syncConfigFields();
       });
 
       const edit = actionButton('Editar', `Editar ${preset.name}`, () => openPresetDialog(preset));
@@ -310,6 +392,8 @@ function openPresetDialog(preset = null) {
   el.dialogTitle.textContent = preset ? 'Editar predefinição' : 'Nova predefinição';
   el.presetForm.elements.name.value = preset?.name ?? '';
   writeTimerFields(el.presetForm, preset ?? timer.config);
+  showFeedback(el.presetFeedback, '');
+  checkActivity(el.presetForm, el.presetFeedback);
   el.dialog.showModal();
   el.presetForm.elements.name.focus();
 }
@@ -322,6 +406,7 @@ el.presetForm.addEventListener('submit', (e) => {
   const nameInput = el.presetForm.elements.name;
   nameInput.setCustomValidity(nameInput.value.trim() ? '' : 'Informe um nome.');
   if (!nameInput.reportValidity()) return;
+  if (!checkActivity(el.presetForm, el.presetFeedback)) return el.presetForm.elements.workMin.focus();
 
   const saved = repo.savePreset({ id: editingPresetId, name: nameInput.value, ...readTimerFields(el.presetForm) });
   if (!saved) return alert('Não foi possível salvar a predefinição.');
@@ -331,14 +416,22 @@ el.presetForm.addEventListener('submit', (e) => {
   // Editing the active preset (or creating a new one) loads it into the timer, if not mid-workout.
   if (!editingPresetId || editingPresetId === selectedPresetId) {
     applyConfig(saved, saved.id);
-    writeTimerFields(el.configForm, timer.config);
+    syncConfigFields();
   }
   renderPresets();
 });
 el.presetForm.elements.name.addEventListener('input', (e) => e.target.setCustomValidity(''));
+el.presetForm.addEventListener('change', (e) => {
+  if (e.target.type !== 'number') return;
+  normalizeField(el.presetForm, e.target, el.presetFeedback);
+  checkActivity(el.presetForm, el.presetFeedback);
+});
+el.presetForm.addEventListener('input', (e) => {
+  if (e.target.type === 'number' && durationOf(el.presetForm, 'work')) checkActivity(el.presetForm, el.presetFeedback);
+});
 
 // ---------- Boot ----------
 
-writeTimerFields(el.configForm, timer.config);
+syncConfigFields();
 renderPresets();
 render();

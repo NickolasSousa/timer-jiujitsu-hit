@@ -53,6 +53,8 @@ h2 { margin: 0; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; 
 
 .layout {
   display: grid;
+  /* minmax(0, …) on every grid: long preset names must truncate, never widen the page */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gap);
   max-width: 1120px;
   margin: 0 auto;
@@ -178,7 +180,7 @@ body[data-phase='idle'] .progress-bar { background: var(--muted); }
 
 /* ---------- Panels & forms ---------- */
 
-.sidebar { display: grid; gap: var(--gap); }
+.sidebar { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gap); }
 
 .panel {
   background: var(--surface);
@@ -219,10 +221,13 @@ input[type='number'] { -moz-appearance: textfield; appearance: textfield; }
 input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
 .hint { margin: 12px 0 0; font-size: 0.875rem; color: var(--muted); }
+.hint:empty { display: none; }
+.hint.is-error { color: var(--danger); }
+input[aria-invalid='true'] { border-color: var(--danger); }
 
 /* ---------- Presets ---------- */
 
-.preset-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.preset-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 
 .preset {
   display: flex;

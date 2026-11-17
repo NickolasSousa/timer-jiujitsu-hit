@@ -18,6 +18,8 @@ Qualquer servidor estático serve (também dá para hospedar no GitHub Pages, Ne
 npm test           # node --test (Node 18+)
 ```
 
+Testes de navegador (layout, sons, Wake Lock, campos): com `npm start` rodando, abra http://localhost:8080/tests/browser/regression.html — usa relógio, áudio e Wake Lock simulados; o `localStorage` dessa origem é sobrescrito durante o teste e restaurado ao final.
+
 ## Estrutura
 
 | Arquivo | Responsabilidade |
